@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Blockly Robot IDE (standalone)
 
 A standalone copy of the Blockly Robot Simulator IDE from the Training Manager site
@@ -46,3 +47,6 @@ Defined in `src/data/demoLevel.js`, in the shape `PortalLevelRunner` builds from
    Step 1 blocks.
 
 Step 2 unlocks once Step 1 is submitted (as a teacher).
+=======
+# lab
+>>>>>>> 9f76d1ba18ed25d024b890a8a67090d0cf49ec85
