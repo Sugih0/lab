@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import Editor from "@monaco-editor/react";
-import { ChevronDown, ChevronLeft, ChevronRight, ChevronsRight, ChevronsLeft, BookOpen, Home, CheckCircle, AlertCircle, Lock, Send, RotateCcw, Save, Play, Square, ListChecks } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, ChevronsRight, ChevronsLeft, BookOpen, Home, CheckCircle, AlertCircle, Lock, Send, RotateCcw, Save, Play, Square, ListChecks, MessageSquare, StickyNote, PenLine } from "lucide-react";
 import { doc, setDoc, getDoc, serverTimestamp, collection, getDocs, deleteDoc, writeBatch, updateDoc, arrayUnion } from "../../firebase/firestore";
 import { db, useAppState } from "../../context/AppStateContext";
 import { FlowchartEditor } from "./FlowchartEditor";
@@ -647,7 +647,7 @@ const TrashIcon = ({ className }) => (
 // The previous step's blocks, shown read-only beside the flowchart that
 // describes them. Blockly makes every injected workspace the "main" one, so
 // the simulator's own workspace is handed back afterwards.
-const ReadOnlyBlocks = ({ xml, mainWorkspaceRef, height = 280 }) => {
+const ReadOnlyBlocks = ({ xml, mainWorkspaceRef, height = 480 }) => {
   const divRef = useRef(null);
 
   useEffect(() => {
@@ -662,7 +662,7 @@ const ReadOnlyBlocks = ({ xml, mainWorkspaceRef, height = 280 }) => {
       readOnly: true,
       renderer: "geras",
       scrollbars: true,
-      zoom: { controls: true, wheel: true, startScale: 0.7, maxScale: 2, minScale: 0.3, scaleSpeed: 1.2 },
+      zoom: { controls: true, wheel: true, startScale: 1.0, maxScale: 3, minScale: 0.3, scaleSpeed: 1.2 },
       move: { scrollbars: true, drag: true, wheel: true },
     });
     try {
@@ -729,6 +729,23 @@ const BlocklyRobotSimulator = ({ challenges = [], levelId, levelName }) => {
     testsOverride[challenges[currentChallengeIndex]?.id] || challenges[currentChallengeIndex]?.tests || [];
   const [testCheck, setTestCheck] = useState(null); // { results, blockedSubmit }
   const [checkingTests, setCheckingTests] = useState(false);
+
+  // Grader notes: { status, comment, reviewedAt } loaded from the challenge's
+  // submissionComments + acknowledgements for the current user.
+  const [graderNotes, setGraderNotes] = useState(null); // null = not loaded / no notes
+  const [graderNotesLoading, setGraderNotesLoading] = useState(false);
+
+  // User's own notes: typed by the student per challenge, persisted locally.
+  const [userNote, setUserNote] = useState('');
+  const [userNoteSaving, setUserNoteSaving] = useState(false);
+  const userNoteDirtyRef = useRef(false);
+  const userNoteTimerRef = useRef(null);
+
+  // Comment thread: conversation between user and admin per challenge
+  const [commentThread, setCommentThread] = useState([]);
+  const [commentInput, setCommentInput] = useState('');
+  const [commentThreadLoading, setCommentThreadLoading] = useState(false);
+  const commentEndRef = useRef(null);
   // A result only stands for the blocks it was run on
   useEffect(() => setTestCheck(null), [currentChallengeIndex, generatedCode]);
 
@@ -857,6 +874,189 @@ const BlocklyRobotSimulator = ({ challenges = [], levelId, levelName }) => {
 
     loadSubmissions();
   }, [currentUser, levelId]);
+
+  // Load grader notes (submissionComments + acknowledgement status) for the
+  // current challenge whenever the challenge index changes or after a submit.
+  useEffect(() => {
+    const challenge = challenges[currentChallengeIndex];
+    if (!challenge?.unitId || !levelId || !currentUser?.username) {
+      setGraderNotes(null);
+      return;
+    }
+
+    let cancelled = false;
+    setGraderNotesLoading(true);
+
+    (async () => {
+      try {
+        const baseChallengeId = challenge.id.includes('_step_')
+          ? challenge.id.split('_step_')[0]
+          : challenge.id;
+        const isStepChallenge = challenge.id.includes('_step_');
+        const stepSuffix = isStepChallenge ? challenge.id.split('_step_')[1] : null;
+        const ackKey = stepSuffix !== null
+          ? `${currentUser.username.toLowerCase()}--${stepSuffix}`
+          : currentUser.username.toLowerCase();
+
+        const chRef = doc(
+          db,
+          'codingLevels',
+          levelId,
+          'units_new',
+          challenge.unitId,
+          'challenges',
+          baseChallengeId
+        );
+        const snap = await getDoc(chRef);
+        if (cancelled) return;
+
+        if (snap.exists()) {
+          const data = snap.data();
+          const acks = data.acknowledgements || {};
+          const comments = data.submissionComments || {};
+          const ack = acks[ackKey];
+          const comment = comments[ackKey];
+
+          if (ack && (ack.status === 'approved' || ack.status === 'needs_revision') && (comment || ack.status)) {
+            setGraderNotes({
+              status: ack.status,
+              comment: comment || '',
+              reviewedAt: ack.reviewedAt,
+            });
+          } else {
+            setGraderNotes(null);
+          }
+        } else {
+          setGraderNotes(null);
+        }
+      } catch (err) {
+        console.error('Error loading grader notes:', err);
+        if (!cancelled) setGraderNotes(null);
+      } finally {
+        if (!cancelled) setGraderNotesLoading(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  // Reload notes after a submission completes (submitting goes false -> completedChallenges changes)
+  }, [currentChallengeIndex, levelId, currentUser?.username, challenges, completedChallenges]);
+
+  // Load user's own notes for the current challenge
+  useEffect(() => {
+    const challenge = challenges[currentChallengeIndex];
+    if (!challenge || !levelId || !currentUser?.username) {
+      setUserNote('');
+      return;
+    }
+    const noteId = `${levelId}_${challenge.id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+    let cancelled = false;
+    (async () => {
+      try {
+        const noteDoc = await getDoc(doc(db, 'users', currentUser.username.toLowerCase(), 'challengeNotes', noteId));
+        if (cancelled) return;
+        setUserNote(noteDoc.exists() ? noteDoc.data().text || '' : '');
+        userNoteDirtyRef.current = false;
+      } catch (err) {
+        console.error('Error loading user note:', err);
+        if (!cancelled) setUserNote('');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentChallengeIndex, levelId, currentUser?.username, challenges]);
+
+  // Save user note (called on explicit save or auto-save)
+  const saveUserNote = useCallback(async (text) => {
+    const challenge = challenges[currentChallengeIndex];
+    if (!challenge || !levelId || !currentUser?.username) return;
+    const noteId = `${levelId}_${challenge.id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+    setUserNoteSaving(true);
+    try {
+      await setDoc(
+        doc(db, 'users', currentUser.username.toLowerCase(), 'challengeNotes', noteId),
+        { text, updatedAt: serverTimestamp() }
+      );
+      userNoteDirtyRef.current = false;
+    } catch (err) {
+      console.error('Error saving user note:', err);
+    } finally {
+      setUserNoteSaving(false);
+    }
+  }, [challenges, currentChallengeIndex, levelId, currentUser?.username]);
+
+  // Handle user note text change with auto-save debounce
+  const handleUserNoteChange = useCallback((e) => {
+    const text = e.target.value;
+    setUserNote(text);
+    userNoteDirtyRef.current = true;
+    if (userNoteTimerRef.current) clearTimeout(userNoteTimerRef.current);
+    userNoteTimerRef.current = setTimeout(() => saveUserNote(text), 1500);
+  }, [saveUserNote]);
+
+  // Flush pending auto-save on unmount or challenge change
+  useEffect(() => {
+    return () => {
+      if (userNoteTimerRef.current) {
+        clearTimeout(userNoteTimerRef.current);
+        userNoteTimerRef.current = null;
+      }
+    };
+  }, [currentChallengeIndex]);
+
+  // Load comment thread for current challenge
+  useEffect(() => {
+    const challenge = challenges[currentChallengeIndex];
+    if (!challenge || !levelId || !currentUser?.username) {
+      setCommentThread([]);
+      return;
+    }
+    const threadId = `${levelId}_${challenge.id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+    let cancelled = false;
+    setCommentThreadLoading(true);
+    (async () => {
+      try {
+        const threadDoc = await getDoc(doc(db, 'commentThreads', threadId));
+        if (cancelled) return;
+        setCommentThread(threadDoc.exists() ? threadDoc.data().messages || [] : []);
+      } catch (err) {
+        console.error('Error loading comment thread:', err);
+        if (!cancelled) setCommentThread([]);
+      } finally {
+        if (!cancelled) setCommentThreadLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentChallengeIndex, levelId, currentUser?.username, challenges]);
+
+  // Scroll to bottom of comment thread when new messages arrive
+  useEffect(() => {
+    if (commentEndRef.current) {
+      commentEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [commentThread]);
+
+  // Send a comment message
+  const sendComment = useCallback(async () => {
+    const challenge = challenges[currentChallengeIndex];
+    if (!challenge || !levelId || !currentUser?.username || !commentInput.trim()) return;
+    const threadId = `${levelId}_${challenge.id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const newMessage = {
+      text: commentInput.trim(),
+      sender: currentUser.username,
+      role: currentUser.role || 'teacher',
+      timestamp: Date.now(),
+    };
+    const updatedThread = [...commentThread, newMessage];
+    setCommentThread(updatedThread);
+    setCommentInput('');
+    try {
+      await setDoc(
+        doc(db, 'commentThreads', threadId),
+        { messages: updatedThread, updatedAt: serverTimestamp() }
+      );
+    } catch (err) {
+      console.error('Error saving comment:', err);
+    }
+  }, [challenges, currentChallengeIndex, levelId, currentUser, commentInput, commentThread]);
 
   // Draft key of the challenge whose blocks are on the canvas. It is null while
   // the canvas is being cleared or loaded, so those changes are never kept as
@@ -3859,17 +4059,26 @@ const BlocklyRobotSimulator = ({ challenges = [], levelId, levelName }) => {
         <div className="w-[45%] h-full flex flex-col bg-gray-200">
           {/* Tabs */}
           <div className="flex border-b border-gray-300 bg-white">
-            {["task", "robot", "console", "python"].map((tab) => {
+            {["task", "robot", "console", "python", "notes"].map((tab) => {
               if (tab === "task" && challenges.length === 0) return null;
+              if (tab === "notes" && challenges.length === 0) return null;
               return (
                 <button
                   key={tab}
                   onClick={() => setActiveTab(tab)}
-                  className={`py-2 px-4 border-b-2 capitalize transition-colors ${activeTab === tab
+                  className={`py-2 px-4 border-b-2 capitalize transition-colors relative ${activeTab === tab
                     ? "border-blue-500 text-blue-600 font-bold bg-blue-50"
                     : "border-transparent hover:bg-gray-50"
                     }`}>
-                  {tab}
+                  {tab === "notes" ? (
+                    <span className="flex items-center gap-1.5">
+                      <MessageSquare size={14} />
+                      Notes
+                      {graderNotes && activeTab !== "notes" && (
+                        <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                      )}
+                    </span>
+                  ) : tab}
                 </button>
               );
             })}
@@ -4386,6 +4595,191 @@ const BlocklyRobotSimulator = ({ challenges = [], levelId, levelName }) => {
                     }}
                   />
                 )}
+              </div>
+            </div>
+
+            {/* Notes View */}
+            <div
+              className={`${activeTab === "notes"
+                ? "flex-grow bg-white overflow-hidden flex flex-col"
+                : "hidden"
+                }`}>
+
+              {/* Section 1: My Notes (collapsible) */}
+              <div className="p-4 border-b border-gray-200 flex flex-col" style={{ maxHeight: '35%' }}>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <PenLine size={16} className="text-violet-500" />
+                    <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wide">My Notes</h3>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {userNoteSaving && (
+                      <span className="text-xs text-slate-400 flex items-center gap-1">
+                        <div className="w-3 h-3 border border-slate-300 border-t-violet-500 rounded-full animate-spin" />
+                        Saving...
+                      </span>
+                    )}
+                    {!userNoteSaving && userNoteDirtyRef.current && (
+                      <span className="text-xs text-amber-500">Unsaved</span>
+                    )}
+                    <button
+                      onClick={() => saveUserNote(userNote)}
+                      disabled={userNoteSaving || !userNoteDirtyRef.current}
+                      className="flex items-center gap-1 text-xs font-medium text-violet-600 bg-violet-50 hover:bg-violet-100 px-2.5 py-1 rounded-full transition-colors disabled:opacity-40 disabled:cursor-default"
+                      title="Save notes">
+                      <Save size={12} />
+                      Save
+                    </button>
+                  </div>
+                </div>
+                <textarea
+                  value={userNote}
+                  onChange={handleUserNoteChange}
+                  placeholder="Write your own notes here... (e.g. things to remember, what you tried)"
+                  className="flex-grow w-full resize-none rounded-lg border border-gray-200 bg-slate-50 p-3 text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:border-violet-400 focus:bg-white focus:ring-1 focus:ring-violet-200 transition-all"
+                  style={{ minHeight: '60px' }}
+                />
+              </div>
+
+              {/* Section 2: Grader's Response (kept compact) */}
+              {graderNotes && (
+                <div className="px-4 py-3 border-b border-gray-200">
+                  <div className="flex items-center gap-2 mb-2">
+                    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${
+                      graderNotes.status === 'approved'
+                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                        : 'bg-amber-50 text-amber-700 border border-amber-200'
+                    }`}>
+                      {graderNotes.status === 'approved' ? (
+                        <><CheckCircle size={13} /> Approved</>
+                      ) : (
+                        <><AlertCircle size={13} /> Needs Revision</>
+                      )}
+                    </div>
+                    <span className="text-xs text-slate-400">
+                      {challenges[currentChallengeIndex]?.challengeName}
+                    </span>
+                  </div>
+                  {graderNotes.comment && (
+                    <div className={`p-3 rounded-lg border text-sm leading-relaxed whitespace-pre-wrap ${
+                      graderNotes.status === 'approved'
+                        ? 'bg-emerald-50/50 border-emerald-200 text-slate-700'
+                        : 'bg-amber-50/50 border-amber-200 text-slate-700'
+                    }`}>
+                      <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">Grader Feedback</p>
+                      {graderNotes.comment}
+                    </div>
+                  )}
+                  {graderNotes.reviewedAt && (
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      Reviewed: {graderNotes.reviewedAt.toDate ? graderNotes.reviewedAt.toDate().toLocaleString() : new Date(graderNotes.reviewedAt).toLocaleString()}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Section 3: Comment Thread (conversation between user and admin) */}
+              <div className="flex-grow flex flex-col overflow-hidden">
+                <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 bg-slate-50">
+                  <MessageSquare size={16} className="text-blue-500" />
+                  <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wide">Comments</h3>
+                  <span className="text-[11px] text-slate-400 ml-auto">
+                    {commentThread.length > 0 ? `${commentThread.length} message${commentThread.length > 1 ? 's' : ''}` : ''}
+                  </span>
+                </div>
+
+                {/* Messages area */}
+                <div className="flex-grow overflow-y-auto px-4 py-3 space-y-3" style={{ minHeight: '120px' }}>
+                  {commentThreadLoading ? (
+                    <div className="flex items-center gap-3 py-6 justify-center text-slate-400">
+                      <div className="w-4 h-4 border-2 border-slate-300 border-t-blue-500 rounded-full animate-spin" />
+                      <span className="text-sm">Loading comments...</span>
+                    </div>
+                  ) : commentThread.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-8 text-center">
+                      <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+                        <MessageSquare size={18} className="text-slate-300" />
+                      </div>
+                      <p className="text-xs font-medium text-slate-500">No comments yet</p>
+                      <p className="text-[11px] text-slate-400 mt-1 max-w-[220px]">
+                        Ask a question or leave a comment below. Both users and admins can participate.
+                      </p>
+                    </div>
+                  ) : (
+                    commentThread.map((msg, idx) => {
+                      const isAdmin = msg.role === 'admin' || msg.role === 'trainer';
+                      const isOwnMessage = msg.sender === currentUser?.username;
+                      return (
+                        <div
+                          key={idx}
+                          className={`flex flex-col ${
+                            isOwnMessage ? 'items-end' : 'items-start'
+                          }`}>
+                          <div className="flex items-center gap-1.5 mb-1">
+                            <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold text-white ${
+                              isAdmin ? 'bg-blue-500' : 'bg-violet-500'
+                            }`}>
+                              {(msg.sender || '?')[0].toUpperCase()}
+                            </div>
+                            <span className="text-[11px] font-semibold text-slate-600">
+                              {msg.sender || 'Unknown'}
+                            </span>
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
+                              isAdmin
+                                ? 'bg-blue-100 text-blue-600'
+                                : 'bg-violet-100 text-violet-600'
+                            }`}>
+                              {isAdmin ? 'Admin' : 'User'}
+                            </span>
+                            <span className="text-[10px] text-slate-400">
+                              {msg.timestamp ? new Date(typeof msg.timestamp === 'object' && msg.timestamp.toMillis ? msg.timestamp.toMillis() : msg.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}
+                            </span>
+                          </div>
+                          <div className={`max-w-[85%] px-3.5 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${
+                            isOwnMessage
+                              ? (isAdmin
+                                  ? 'bg-blue-500 text-white rounded-br-md'
+                                  : 'bg-violet-500 text-white rounded-br-md')
+                              : (isAdmin
+                                  ? 'bg-blue-50 text-slate-700 border border-blue-200 rounded-bl-md'
+                                  : 'bg-slate-100 text-slate-700 border border-gray-200 rounded-bl-md')
+                          }`}>
+                            {msg.text}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                  <div ref={commentEndRef} />
+                </div>
+
+                {/* Comment input */}
+                <div className="px-4 py-3 border-t border-gray-200 bg-white">
+                  <div className="flex items-end gap-2">
+                    <textarea
+                      value={commentInput}
+                      onChange={(e) => setCommentInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          sendComment();
+                        }
+                      }}
+                      placeholder={isStaff ? "Reply as admin..." : "Ask a question or leave a comment..."}
+                      className="flex-grow resize-none rounded-xl border border-gray-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 placeholder-slate-400 focus:outline-none focus:border-blue-400 focus:bg-white focus:ring-1 focus:ring-blue-200 transition-all"
+                      style={{ minHeight: '38px', maxHeight: '100px' }}
+                      rows={1}
+                    />
+                    <button
+                      onClick={sendComment}
+                      disabled={!commentInput.trim()}
+                      className="flex items-center justify-center w-9 h-9 rounded-xl bg-blue-500 hover:bg-blue-600 text-white transition-colors disabled:opacity-40 disabled:cursor-default shrink-0"
+                      title="Send comment">
+                      <Send size={16} />
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-slate-400 mt-1.5">Press Enter to send, Shift+Enter for new line</p>
+                </div>
               </div>
             </div>
           </div>
